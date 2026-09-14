@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Pages Skill 自检站</title>
+<meta name="description" content="用于验证 github-pages-deploy skill 全链路的自检静态站。">
+<link rel="canonical" href="https://evergreen0330.github.io/event-platform/">
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<header>
+  <h1>GitHub Pages Skill 自检站</h1>
+  <nav>
+    <a href="#/home">首页</a>
+    <a href="#/probe">自检结果</a>
+  </nav>
+</header>
+
+<main>
+  <section id="view-home">
+    <p>这个站点存在的唯一目的：验证 <strong>github-pages-deploy</strong> skill 的每一层是否真的跑得通。</p>
+    <ul>
+      <li>hash 路由（刷新不 404）</li>
+      <li>相对路径资源（子路径部署可用）</li>
+      <li>seed.json 网络加载 + 离线降级</li>
+      <li>noscript 兜底正文</li>
+    </ul>
+  </section>
+
+  <section id="view-probe" hidden>
+    <h2>运行时自检</h2>
+    <table id="probe-table">
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<noscript>
+  <p>当前浏览器未执行 JavaScript。本自检站需要 JS 才能渲染路由视图；若你是爬虫，页面正文为：GitHub Pages Skill 自检站，用于验证静态发布链路。</p>
+</noscript>
+
+<footer><span id="build-stamp">static</span></footer>
+<script src="assets/js/app.js"></script>
+</body>
+</html>

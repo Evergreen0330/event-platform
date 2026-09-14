@@ -15,14 +15,13 @@
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-OWNER = "Evergreen0330"
-REPO = "zhifei-dronesport"
 API = "https://api.github.com"
 BRANCH = "main"
 
@@ -34,6 +33,35 @@ def sh(*args, check=True):
     if check and r.returncode != 0:
         sys.exit(f"命令失败: {' '.join(args)}\n{r.stderr}")
     return r.stdout
+
+
+def resolve_repo():
+    """目标仓库：GITHUB_REPO=owner/repo 优先，否则从 git remote origin 解析。
+
+    不硬编码仓库名——硬编码会把内容推错仓库，且本脚本会删除"远端有、本地无"的文件，
+    推错仓库等于清空对方仓库。
+    """
+    env = os.environ.get("GITHUB_REPO", "").strip()
+    if env:
+        if "/" not in env:
+            sys.exit("GITHUB_REPO 格式应为 owner/repo")
+        return tuple(env.split("/", 1))
+
+    url = sh("git", "remote", "get-url", "origin", check=False).strip()
+    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$", url)
+    if not m:
+        sys.exit(
+            "无法从 git remote origin 识别仓库。\n"
+            f"  当前 origin = {url!r}\n"
+            "  请先 `git remote add origin https://github.com/<owner>/<repo>.git`，"
+            "或设置环境变量 GITHUB_REPO=<owner>/<repo>"
+        )
+    return m.group(1), m.group(2)
+
+
+OWNER, REPO = resolve_repo()
+# 单次推送允许删除的远端文件上限（超过需显式确认，防止误推错仓库清空内容）
+MASS_DELETE_LIMIT = int(os.environ.get("MASS_DELETE_LIMIT", "5"))
 
 
 def get_token():
@@ -53,6 +81,12 @@ def get_token():
 TOKEN = get_token()
 
 
+class ApiError(Exception):
+    def __init__(self, method, path, code, body):
+        super().__init__(f"API {method} {path} -> {code}\n{body}")
+        self.code = code
+
+
 def req(method, path, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     r = urllib.request.Request(API + path, data=data, method=method)
@@ -64,16 +98,24 @@ def req(method, path, payload=None):
         with urllib.request.urlopen(r, timeout=60) as resp:
             return json.loads(resp.read().decode() or "{}")
     except urllib.error.HTTPError as e:
-        sys.exit(f"API {method} {path} -> {e.code}\n{e.read().decode()[:600]}")
+        raise ApiError(method, path, e.code, e.read().decode()[:600]) from None
+
+
+DRY_RUN = "--dry-run" in sys.argv
 
 
 def main():
-    # 1. 远端 main 当前提交
+    print(f"目标仓库: {OWNER}/{REPO}  分支: {BRANCH}" + ("  [dry-run]" if DRY_RUN else ""))
+
+    # 1. 远端 main 当前提交（404 = 空仓库，其他错误必须抛出，不能当成空仓库）
     try:
         ref = req("GET", f"/repos/{OWNER}/{REPO}/git/ref/heads/{BRANCH}")
         parent_sha = ref["object"]["sha"]
-    except SystemExit:
-        parent_sha = None
+    except ApiError as e:
+        if e.code == 404:
+            parent_sha = None
+        else:
+            sys.exit(str(e))
 
     base_tree = None
     remote_blobs = {}
@@ -105,10 +147,20 @@ def main():
         changed.append(path)
 
     # 删除远端已有、本地已不存在的文件
-    for path in remote_blobs:
-        if path not in local_files:
-            entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
-            changed.append(f"{path} (删除)")
+    deletions = [p for p in remote_blobs if p not in local_files]
+    if len(deletions) > MASS_DELETE_LIMIT:
+        print(f"\n⚠️  本次将删除远端 {len(deletions)} 个文件（上限 {MASS_DELETE_LIMIT}）：")
+        for p in deletions[:20]:
+            print(f"      - {p}")
+        if len(deletions) > 20:
+            print(f"      ... 另有 {len(deletions) - 20} 个")
+        print(f"  目标仓库: https://github.com/{OWNER}/{REPO}")
+        print("  如果这不是你预期的仓库，立即中断（Ctrl-C）。")
+        if os.environ.get("CONFIRM_MASS_DELETE") != "1":
+            sys.exit("  已中断。确认无误请加环境变量 CONFIRM_MASS_DELETE=1 重跑。")
+    for path in deletions:
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+        changed.append(f"{path} (删除)")
 
     if not entries:
         print("✅ 远端已是最新，无需推送")
@@ -117,6 +169,10 @@ def main():
     print(f"待推送 {len(entries)} 项：")
     for c in changed:
         print(f"  - {c}")
+
+    if DRY_RUN:
+        print("✅ dry-run 结束，未做任何写入")
+        return
 
     # 3. 建 tree → commit → 更新 ref
     tree = req("POST", f"/repos/{OWNER}/{REPO}/git/trees", {

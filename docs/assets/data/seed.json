@@ -1,0 +1,8 @@
+{
+  "generated_for": "github-pages-deploy skill selftest",
+  "items": [
+    { "id": 1, "name": "资源可达性验证", "source": "seed.json" },
+    { "id": 2, "name": "字节一致性验证", "source": "seed.json" },
+    { "id": 3, "name": "浏览器渲染验证", "source": "seed.json" }
+  ]
+}
