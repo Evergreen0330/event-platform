@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://evergreen0330.github.io/event-platform/sitemap.xml
