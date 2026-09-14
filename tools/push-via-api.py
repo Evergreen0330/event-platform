@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-通过 GitHub Git Data API 把本地提交推送到远端 main。
+通过 GitHub Git Data API 把本地 main 的内容推送到远端。
 
 用途：当 `git push` 因网络/代理限制无法建立到 github.com:443 的连接时，
-改走 api.github.com（REST API）完成同样的推送。内容与 git push 完全等价。
+改走 api.github.com（REST API）完成同样的推送（内容完全等价）。
+
+⚠️ 已知限制（预期行为，不是 bug）：
+    GitHub API 会归一化提交元数据（message 去尾部换行、时区转 UTC），
+    所以经 API 创建的 commit SHA 与本地提交不同。走一次 API 兜底后，
+    本地与远端 SHA 会分叉（内容一致），之后 `git push` 会被
+    non-fast-forward 拒绝——继续用本脚本同步即可，内容始终收敛；
+    不要 `git pull` 强行合并，会把两边历史搅在一起。
 
 用法：
-    python3 tools/push-via-api.py
+    python3 tools/push-via-api.py [--dry-run]
 
 令牌来源（按顺序尝试）：
     1. 环境变量 GITHUB_TOKEN
@@ -26,6 +33,10 @@ API = "https://api.github.com"
 BRANCH = "main"
 
 ROOT = Path(__file__).resolve().parent.parent
+DRY_RUN = "--dry-run" in sys.argv
+
+# 单次推送允许删除的远端文件上限（超过需显式确认，防止误推错仓库清空内容）
+MASS_DELETE_LIMIT = int(os.environ.get("MASS_DELETE_LIMIT", "5"))
 
 
 def sh(*args, check=True):
@@ -38,7 +49,7 @@ def sh(*args, check=True):
 def resolve_repo():
     """目标仓库：GITHUB_REPO=owner/repo 优先，否则从 git remote origin 解析。
 
-    不硬编码仓库名——硬编码会把内容推错仓库，且本脚本会删除"远端有、本地无"的文件，
+    不硬编码仓库名——硬编码会把内容推错仓库，而本脚本会删除"远端有、本地无"的文件，
     推错仓库等于清空对方仓库。
     """
     env = os.environ.get("GITHUB_REPO", "").strip()
@@ -59,11 +70,6 @@ def resolve_repo():
     return m.group(1), m.group(2)
 
 
-OWNER, REPO = resolve_repo()
-# 单次推送允许删除的远端文件上限（超过需显式确认，防止误推错仓库清空内容）
-MASS_DELETE_LIMIT = int(os.environ.get("MASS_DELETE_LIMIT", "5"))
-
-
 def get_token():
     tok = os.environ.get("GITHUB_TOKEN", "").strip()
     if tok:
@@ -78,6 +84,7 @@ def get_token():
     return tok
 
 
+OWNER, REPO = resolve_repo()
 TOKEN = get_token()
 
 
@@ -101,13 +108,10 @@ def req(method, path, payload=None):
         raise ApiError(method, path, e.code, e.read().decode()[:600]) from None
 
 
-DRY_RUN = "--dry-run" in sys.argv
-
-
 def main():
     print(f"目标仓库: {OWNER}/{REPO}  分支: {BRANCH}" + ("  [dry-run]" if DRY_RUN else ""))
 
-    # 1. 远端 main 当前提交（404 = 空仓库，其他错误必须抛出，不能当成空仓库）
+    # 1. 远端 main 当前提交（404 = 空仓库；其他错误必须抛出，不能当成空仓库）
     try:
         ref = req("GET", f"/repos/{OWNER}/{REPO}/git/ref/heads/{BRANCH}")
         parent_sha = ref["object"]["sha"]
@@ -128,45 +132,50 @@ def main():
     else:
         print("远端为空仓库，将创建首个提交")
 
-    # 2. 逐文件比较本地 git blob 哈希与远端，找出差异
+    # 2. 逐文件比较本地 git blob 哈希与远端，找出差异（只上传有变化的文件）
     local_files = [p for p in sh("git", "ls-files", "-z").split("\0") if p]
     entries, changed = [], []
     for path in local_files:
         fp = ROOT / path
         if not fp.is_file():
             continue
-        local_sha = sh("git", "hash-object", path).strip()
+        # -w 让 blob 入库，后面 cat-file 才能取到内容（工作区有未提交修改时尤为必要）
+        local_sha = sh("git", "hash-object", "-w", "--", path).strip()
         if remote_blobs.get(path) == local_sha:
             continue
+        if DRY_RUN:
+            changed.append(path)
+            continue
+        r = subprocess.run(["git", "cat-file", "blob", local_sha],
+                           cwd=ROOT, capture_output=True, check=True)
         blob = req("POST", f"/repos/{OWNER}/{REPO}/git/blobs", {
-            "content": base64.b64encode(fp.read_bytes()).decode(),
+            "content": base64.b64encode(r.stdout).decode(),
             "encoding": "base64",
         })
         mode = sh("git", "ls-files", "-s", "--", path).split()[0]
         entries.append({"path": path, "mode": mode, "type": "blob", "sha": blob["sha"]})
         changed.append(path)
 
-    # 删除远端已有、本地已不存在的文件
+    # 3. 删除远端已有、本地已不存在的文件（带护栏）
     deletions = [p for p in remote_blobs if p not in local_files]
     if len(deletions) > MASS_DELETE_LIMIT:
         print(f"\n⚠️  本次将删除远端 {len(deletions)} 个文件（上限 {MASS_DELETE_LIMIT}）：")
-        for p in deletions[:20]:
+        for p in sorted(deletions)[:20]:
             print(f"      - {p}")
         if len(deletions) > 20:
             print(f"      ... 另有 {len(deletions) - 20} 个")
         print(f"  目标仓库: https://github.com/{OWNER}/{REPO}")
-        print("  如果这不是你预期的仓库，立即中断（Ctrl-C）。")
         if os.environ.get("CONFIRM_MASS_DELETE") != "1":
             sys.exit("  已中断。确认无误请加环境变量 CONFIRM_MASS_DELETE=1 重跑。")
     for path in deletions:
         entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         changed.append(f"{path} (删除)")
 
-    if not entries:
+    if not entries and not changed:
         print("✅ 远端已是最新，无需推送")
         return
 
-    print(f"待推送 {len(entries)} 项：")
+    print(f"待推送 {len(entries) or len(changed)} 项：")
     for c in changed:
         print(f"  - {c}")
 
@@ -174,9 +183,9 @@ def main():
         print("✅ dry-run 结束，未做任何写入")
         return
 
-    # 3. 建 tree → commit → 更新 ref
+    # 4. 建 tree → commit → 更新 ref
     tree = req("POST", f"/repos/{OWNER}/{REPO}/git/trees", {
-        "base_tree": base_tree, "tree": entries,
+        **({"base_tree": base_tree} if base_tree else {}), "tree": entries,
     })
     msg = sh("git", "log", "-1", "--pretty=%B").strip()
     author = {
@@ -198,12 +207,13 @@ def main():
         req("POST", f"/repos/{OWNER}/{REPO}/git/refs",
             {"ref": f"refs/heads/{BRANCH}", "sha": commit["sha"]})
 
-    print(f"✅ 已推送，远端 {BRANCH} = {commit['sha'][:8]}")
+    print(f"✅ 已推送，远端 {BRANCH} = {commit['sha'][:8]}（内容与本地 HEAD 一致，"
+          "SHA 与本地分叉属预期行为）")
 
-    # 4. 本地远端跟踪引用对齐（本地无该对象时忽略）
+    # 5. 本地远端跟踪引用对齐（该对象只存在于服务端，本地 git 命令不要依赖它）
     subprocess.run(["git", "update-ref", f"refs/remotes/origin/{BRANCH}", commit["sha"]],
                    cwd=ROOT, capture_output=True)
-    print(f"本地 origin/{BRANCH} 引用已对齐")
+    print("本地 origin/main 引用已对齐")
 
 
 if __name__ == "__main__":
