@@ -102,7 +102,7 @@
 
   // ---- 启动 ----
   var stamp = document.getElementById('build-stamp');
-  if (stamp) stamp.textContent = 'selftest build: ' + location.pathname;
+  if (stamp) stamp.textContent = 'selftest v2 · API 兜底验证 · ' + location.pathname;
 
   loadSeed().then(function () {
     record('seed.json 网络请求', dataState.source === 'network',
